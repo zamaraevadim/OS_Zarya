@@ -1,22 +1,38 @@
-//! Device Drivers Subsystem
-//! 
-//! Implements drivers for:
-//! - Serial port (for debugging)
-//! - Keyboard (PS/2 and USB HID)
-//! - Framebuffer (VESA/GOP)
-//! - Mouse
+//! # Драйверы устройств операционной системы Zarya
+//!
+//! Модуль содержит драйверы для базовых устройств:
+//! - Последовательный порт (UART 16550)
+//! - Клавиатура PS/2
+//! - Мышь PS/2
+//! - Framebuffer (графический буфер)
 
-use x86_64::instructions::{port::Port, interrupts};
-use spin::Mutex;
+#![no_std]
 
 pub mod serial;
 pub mod keyboard;
-pub mod framebuffer;
 pub mod mouse;
+pub mod framebuffer;
 
-/// Initialize all device drivers
-pub fn init() {
-    serial::init();
-    keyboard::init();
-    framebuffer::init();
+pub use serial::SerialPort;
+pub use keyboard::PS2Keyboard;
+pub use mouse::PS2Mouse;
+pub use framebuffer::Framebuffer;
+
+/// Trait для всех драйверов устройств
+pub trait DeviceDriver {
+    /// Инициализация устройства
+    fn init(&mut self);
+    
+    /// Проверка наличия устройства
+    fn detect(&self) -> bool;
+    
+    /// Получение имени устройства
+    fn name(&self) -> &'static str;
+}
+
+/// Базовая структура для прерываний устройств
+#[derive(Debug, Clone, Copy)]
+pub struct InterruptInfo {
+    pub irq: u8,
+    pub vector: u8,
 }

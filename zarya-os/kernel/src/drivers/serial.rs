@@ -1,99 +1,145 @@
-//! Serial Port Driver (COM1)
-//! 
-//! Provides basic serial I/O for debugging output.
+//! # Драйвер последовательного порта (UART 16550)
+//!
+//! Обеспечивает вывод отладочной информации через COM1 порт.
+//! Используется для раннего логгирования до инициализации других устройств.
+
+#![no_std]
 
 use x86_64::instructions::port::Port;
 use spin::Mutex;
 use core::fmt::{self, Write};
 
-/// Base port for COM1
-const SERIAL_PORT: u16 = 0x3F8;
+/// Базовый адрес COM1 порта
+const COM1_BASE: u16 = 0x3F8;
 
-/// Serial port writer for println! macro
-static SERIAL_WRITER: Mutex<SerialPort> = Mutex::new(SerialPort {
-    port: Port::new(SERIAL_PORT),
-});
+/// Глобальный экземпляр UART (для использования из макросов print!)
+static UART: Mutex<Option<Uart16550>> = Mutex::new(None);
 
-/// Serial port interface
-pub struct SerialPort {
-    port: Port<u8>,
+/// Инициализация UART драйвера
+pub fn init() {
+    let mut uart = Uart16550::new(COM1_BASE);
+    uart.init();
+    *UART.lock() = Some(uart);
 }
 
-impl SerialPort {
-    /// Initialize serial port with standard settings
+/// Написание строки в UART
+pub fn write_str(s: &str) {
+    let mut uart_guard = UART.lock();
+    if let Some(ref mut uart) = *uart_guard {
+        let _ = uart.write_str(s);
+    }
+}
+
+/// Структура UART 16550
+pub struct Uart16550 {
+    base_port: u16,
+}
+
+impl Uart16550 {
+    /// Создание нового экземпляра UART
+    pub const fn new(base_port: u16) -> Self {
+        Self { base_port }
+    }
+    
+    /// Инициализация UART
     pub fn init(&mut self) {
         unsafe {
-            // Disable interrupts
-            self.port.write(0x00);
+            // Отключаем прерывания
+            Port::new(self.base_port + 1).write(0x00u8);
             
-            // Enable DLAB (set baud rate divisor)
-            let mut line_control = Port::new(SERIAL_PORT + 3);
-            line_control.write(0x80);
+            // Включаем DLAB (доступ к делителю частоты)
+            Port::new(self.base_port + 3).write(0x80u8);
             
-            // Set divisor to 3 (38400 baud)
-            let mut divisor_latch_low = Port::new(SERIAL_PORT);
-            let mut divisor_latch_high = Port::new(SERIAL_PORT + 1);
-            divisor_latch_low.write(0x03);
-            divisor_latch_high.write(0x00);
+            // Устанавливаем делитель частоты для 9600 бод
+            // При тактовой частоте 1.8432 MHz: 1.8432MHz / (16 * 9600) = 12
+            Port::new(self.base_port + 0).write(0x0Cu8); // Low byte
+            Port::new(self.base_port + 1).write(0x00u8); // High byte
             
-            // 8 bits, no parity, one stop bit
-            line_control.write(0x03);
+            // Настраиваем формат данных: 8 бит, без четности, 1 стоп-бит
+            Port::new(self.base_port + 3).write(0x03u8);
             
-            // Enable FIFO
-            let mut fifo_control = Port::new(SERIAL_PORT + 2);
-            fifo_control.write(0x07);
+            // Включаем FIFO буфер
+            Port::new(self.base_port + 2).write(0xC7u8);
             
-            // Ready for use
+            // Включаем RTS и DTR
+            Port::new(self.base_port + 4).write(0x0Bu8);
         }
     }
     
-    /// Write a byte to serial port
-    fn write_byte(&mut self, byte: u8) {
+    /// Проверка, готов ли передатчик
+    #[inline]
+    fn is_transmit_empty(&self) -> bool {
         unsafe {
-            // Wait until transmit buffer is empty
-            let mut line_status = Port::new(SERIAL_PORT + 5);
-            while line_status.read() & 0x20 == 0 {}
-            
-            // Send byte
-            self.port.write(byte);
+            Port::new(self.base_port + 5).read() & 0x20 != 0
+        }
+    }
+    
+    /// Отправка одного байта
+    fn send_byte(&mut self, data: u8) {
+        while !self.is_transmit_empty() {
+            core::hint::spin_loop();
+        }
+        unsafe {
+            Port::new(self.base_port).write(data);
+        }
+    }
+    
+    /// Получение одного байта (блокирующее)
+    pub fn recv_byte(&mut self) -> Option<u8> {
+        unsafe {
+            if Port::new(self.base_port + 5).read() & 0x01 != 0 {
+                Some(Port::new(self.base_port).read())
+            } else {
+                None
+            }
         }
     }
 }
 
-impl Write for SerialPort {
+impl fmt::Write for Uart16550 {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for byte in s.bytes() {
             if byte == b'\n' {
-                self.write_byte(b'\r');
+                self.send_byte(b'\r');
             }
-            self.write_byte(byte);
+            self.send_byte(byte);
         }
         Ok(())
     }
 }
 
-/// Initialize serial console
-pub fn init() {
-    SERIAL_WRITER.lock().init();
+/// Обертка для использования с глобальным UART
+pub struct SerialPort;
+
+impl SerialPort {
+    /// Создание нового экземпляра
+    pub const fn new() -> Self {
+        Self
+    }
+    
+    /// Инициализация
+    pub fn init(&self) {
+        init();
+    }
+    
+    /// Написание формата
+    pub fn write_fmt(args: fmt::Arguments) {
+        use core::fmt::Write;
+        
+        let mut uart_guard = UART.lock();
+        if let Some(ref mut uart) = *uart_guard {
+            let _ = uart.write_fmt(args);
+        }
+    }
 }
 
-/// Print formatted string to serial port
-#[doc(hidden)]
-pub fn _print(args: fmt::Arguments) {
-    use core::fmt::Write;
-    SERIAL_WRITER.lock().write_fmt(args).unwrap();
-}
-
-/// Macro for serial output
-#[macro_export]
-macro_rules! print {
-    ($($arg:tt)*) => {
-        $crate::drivers::serial::_print(format_args!($($arg)*));
-    };
-}
-
-#[macro_export]
-macro_rules! println {
-    () => ($crate::print!("\n"));
-    ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_uart_creation() {
+        let uart = Uart16550::new(COM1_BASE);
+        assert_eq!(uart.base_port, COM1_BASE);
+    }
 }
