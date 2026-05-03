@@ -1,0 +1,23 @@
+[package]
+name = "zarya-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+spin = "0.9"
+x86_64 = "0.14"
+bootloader = "0.9"
+volatile = "0.4"
+zero = "0.1"
+offset_of = "0.1"
+
+[dependencies.lazy_static]
+version = "1.4"
+features = ["spin_no_std"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
