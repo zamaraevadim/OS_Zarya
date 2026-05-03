@@ -1,257 +1,334 @@
-//! Filesystem Subsystem
-//! 
-//! Implements:
-//! - Virtual Filesystem (VFS) layer
-//! - ZFS (Zarya File System) driver
-//! - Support for FAT32, ext4, NTFS via modules
+//! # Виртуальная файловая система (VFS) операционной системы Zarya
+//!
+//! Предоставляет абстрактный интерфейс для работы с файлами.
+//! Поддерживает различные типы файловых систем через драйверы.
 
-use alloc::{string::String, vec::Vec};
+#![no_std]
+
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
+use alloc::vec::Vec;
+use alloc::string::String;
 
-/// File permissions
-#[derive(Debug, Clone, Copy)]
-pub struct Permissions {
-    pub owner_read: bool,
-    pub owner_write: bool,
-    pub owner_exec: bool,
-    pub group_read: bool,
-    pub group_write: bool,
-    pub group_exec: bool,
-    pub other_read: bool,
-    pub other_write: bool,
-    pub other_exec: bool,
-}
+/// Максимальное количество открытых файлов в системе
+const MAX_OPEN_FILES: usize = 1024;
 
-impl Default for Permissions {
-    fn default() -> Self {
-        Permissions {
-            owner_read: true,
-            owner_write: true,
-            owner_exec: false,
-            group_read: true,
-            group_write: false,
-            group_exec: false,
-            other_read: true,
-            other_write: false,
-            other_exec: false,
-        }
-    }
-}
+/// Глобальная таблица открытых файлов
+static OPEN_FILES: Mutex<[Option<FileDescriptor>; MAX_OPEN_FILES]> = 
+    Mutex::new([None; MAX_OPEN_FILES]);
 
-/// File type
+/// Счетчик для выделения FD
+static NEXT_FD: AtomicUsize = AtomicUsize::new(3); // 0, 1, 2 зарезервированы (stdin, stdout, stderr)
+
+/// Типы файлов
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Regular,
     Directory,
-    Symlink,
+    CharacterDevice,
     BlockDevice,
-    CharDevice,
-    FIFO,
+    Fifo,
     Socket,
+    Symlink,
 }
 
-/// File metadata
+/// Режимы доступа к файлу
+#[derive(Debug, Clone, Copy)]
+pub struct FileMode {
+    pub read: bool,
+    pub write: bool,
+    pub execute: bool,
+}
+
+impl FileMode {
+    pub const fn new(read: bool, write: bool, execute: bool) -> Self {
+        Self { read, write, execute }
+    }
+    
+    pub const fn READ_ONLY: Self = Self::new(true, false, false);
+    pub const fn WRITE_ONLY: Self = Self::new(false, true, false);
+    pub const fn READ_WRITE: Self = Self::new(true, true, false);
+}
+
+/// Атрибуты файла
 #[derive(Debug, Clone)]
-pub struct Metadata {
+pub struct FileAttributes {
     pub file_type: FileType,
     pub size: u64,
-    pub permissions: Permissions,
-    pub owner_uid: u32,
-    pub group_gid: u32,
+    pub mode: FileMode,
+    pub uid: u32,
+    pub gid: u32,
     pub created_at: u64,
     pub modified_at: u64,
     pub accessed_at: u64,
 }
 
-/// File descriptor
+/// Trait для файловых операций
+pub trait FileOps {
+    /// Чтение из файла
+    fn read(&self, buf: &mut [u8], offset: u64) -> Result<usize, FsError>;
+    
+    /// Запись в файл
+    fn write(&self, buf: &[u8], offset: u64) -> Result<usize, FsError>;
+    
+    /// Получение атрибутов файла
+    fn get_attr(&self) -> Result<FileAttributes, FsError>;
+    
+    /// Установка позиции чтения/записи
+    fn seek(&self, pos: SeekFrom) -> Result<u64, FsError>;
+}
+
+/// Позиция для seek
+#[derive(Debug, Clone, Copy)]
+pub enum SeekFrom {
+    Start(u64),
+    Current(i64),
+    End(i64),
+}
+
+/// Ошибки файловой системы
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsError {
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    InvalidInput,
+    OutOfSpace,
+    NotADirectory,
+    NotAFile,
+    IoError,
+    Unsupported,
+}
+
+/// Дескриптор открытого файла
 pub struct FileDescriptor {
-    pub id: u64,
+    pub fd: usize,
     pub path: String,
     pub mode: FileMode,
     pub position: u64,
-    pub metadata: Metadata,
+    pub file_type: FileType,
+    // В полной версии здесь была бы ссылка на конкретную реализацию FileOps
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileMode {
-    Read,
-    Write,
-    ReadWrite,
-    Append,
+impl FileDescriptor {
+    fn new(fd: usize, path: &str, mode: FileMode, file_type: FileType) -> Self {
+        Self {
+            fd,
+            path: String::from(path),
+            mode,
+            position: 0,
+            file_type,
+        }
+    }
 }
 
-/// VFS node
-pub struct VfsNode {
+/// Виртуальная файловая система
+pub struct Vfs {
+    mounts: Vec<MountPoint>,
+}
+
+/// Точка монтирования
+pub struct MountPoint {
+    pub path: String,
+    pub fs_type: FsType,
+    pub device: Option<String>,
+}
+
+/// Типы поддерживаемых ФС
+#[derive(Debug, Clone)]
+pub enum FsType {
+    Zfs,      // Нативная Zarya File System
+    Ext4,
+    Fat32,
+    Ntfs,
+    ExFat,
+    Tmpfs,
+}
+
+impl Vfs {
+    /// Создание новой VFS
+    pub fn new() -> Self {
+        Self {
+            mounts: Vec::new(),
+        }
+    }
+    
+    /// Монтирование файловой системы
+    pub fn mount(&mut self, path: &str, fs_type: FsType, device: Option<&str>) -> Result<(), FsError> {
+        self.mounts.push(MountPoint {
+            path: String::from(path),
+            fs_type,
+            device: device.map(String::from),
+        });
+        Ok(())
+    }
+    
+    /// Размонтирование файловой системы
+    pub fn unmount(&mut self, path: &str) -> Result<(), FsError> {
+        if let Some(pos) = self.mounts.iter().position(|m| m.path == path) {
+            self.mounts.remove(pos);
+            Ok(())
+        } else {
+            Err(FsError::NotFound)
+        }
+    }
+    
+    /// Открытие файла
+    pub fn open(&self, path: &str, mode: FileMode) -> Result<usize, FsError> {
+        // Выделение нового FD
+        let fd = NEXT_FD.fetch_add(1, Ordering::Relaxed);
+        
+        if fd >= MAX_OPEN_FILES {
+            return Err(FsError::OutOfSpace);
+        }
+        
+        // Определение типа файла (упрощенно)
+        let file_type = if path.ends_with('/') {
+            FileType::Directory
+        } else {
+            FileType::Regular
+        };
+        
+        let file_desc = FileDescriptor::new(fd, path, mode, file_type);
+        
+        // Добавление в таблицу открытых файлов
+        let mut open_files = OPEN_FILES.lock();
+        open_files[fd] = Some(file_desc);
+        
+        Ok(fd)
+    }
+    
+    /// Закрытие файла
+    pub fn close(&self, fd: usize) -> Result<(), FsError> {
+        let mut open_files = OPEN_FILES.lock();
+        
+        if fd >= MAX_OPEN_FILES || open_files[fd].is_none() {
+            return Err(FsError::InvalidInput);
+        }
+        
+        open_files[fd] = None;
+        Ok(())
+    }
+    
+    /// Чтение из файла
+    pub fn read(&self, fd: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+        let open_files = OPEN_FILES.lock();
+        
+        if fd >= MAX_OPEN_FILES || open_files[fd].is_none() {
+            return Err(FsError::InvalidInput);
+        }
+        
+        let file_desc = open_files[fd].as_ref().unwrap();
+        
+        if !file_desc.mode.read {
+            return Err(FsError::PermissionDenied);
+        }
+        
+        // В полной версии здесь был бы вызов соответствующего драйвера ФС
+        // Для демонстрации возвращаем 0 (EOF)
+        Ok(0)
+    }
+    
+    /// Запись в файл
+    pub fn write(&self, fd: usize, buf: &[u8]) -> Result<usize, FsError> {
+        let open_files = OPEN_FILES.lock();
+        
+        if fd >= MAX_OPEN_FILES || open_files[fd].is_none() {
+            return Err(FsError::InvalidInput);
+        }
+        
+        let file_desc = open_files[fd].as_ref().unwrap();
+        
+        if !file_desc.mode.write {
+            return Err(FsError::PermissionDenied);
+        }
+        
+        // В полной версии здесь был бы вызов соответствующего драйвера ФС
+        Ok(buf.len())
+    }
+    
+    /// Создание директории
+    pub fn mkdir(&self, path: &str) -> Result<(), FsError> {
+        println!("[VFS] mkdir: {}", path);
+        // В полной версии создание директории в соответствующей ФС
+        Ok(())
+    }
+    
+    /// Удаление файла
+    pub fn unlink(&self, path: &str) -> Result<(), FsError> {
+        println!("[VFS] unlink: {}", path);
+        Ok(())
+    }
+    
+    /// Чтение содержимого директории
+    pub fn readdir(&self, fd: usize) -> Result<Vec<DirEntry>, FsError> {
+        let open_files = OPEN_FILES.lock();
+        
+        if fd >= MAX_OPEN_FILES || open_files[fd].is_none() {
+            return Err(FsError::InvalidInput);
+        }
+        
+        let file_desc = open_files[fd].as_ref().unwrap();
+        
+        if file_desc.file_type != FileType::Directory {
+            return Err(FsError::NotADirectory);
+        }
+        
+        // Демонстрационные данные
+        Ok(vec![
+            DirEntry { name: String::from("."), file_type: FileType::Directory },
+            DirEntry { name: String::from(".."), file_type: FileType::Directory },
+            DirEntry { name: String::from("home"), file_type: FileType::Directory },
+            DirEntry { name: String::from("bin"), file_type: FileType::Directory },
+        ])
+    }
+    
+    /// Получение информации о файле
+    pub fn stat(&self, path: &str) -> Result<FileAttributes, FsError> {
+        Ok(FileAttributes {
+            file_type: if path.ends_with('/') { FileType::Directory } else { FileType::Regular },
+            size: 0,
+            mode: FileMode::READ_WRITE,
+            uid: 1000,
+            gid: 1000,
+            created_at: 0,
+            modified_at: 0,
+            accessed_at: 0,
+        })
+    }
+}
+
+/// Элемент директории
+#[derive(Debug, Clone)]
+pub struct DirEntry {
     pub name: String,
-    pub metadata: Metadata,
-    pub children: Vec<VfsNode>,
-    pub content: Vec<u8>,
+    pub file_type: FileType,
 }
 
-impl VfsNode {
-    pub fn new(name: &str, file_type: FileType) -> Self {
-        VfsNode {
-            name: name.to_string(),
-            metadata: Metadata {
-                file_type,
-                size: 0,
-                permissions: Permissions::default(),
-                owner_uid: 0,
-                group_gid: 0,
-                created_at: 0,
-                modified_at: 0,
-                accessed_at: 0,
-            },
-            children: Vec::new(),
-            content: Vec::new(),
-        }
-    }
+/// Инициализация VFS
+pub fn init() -> Vfs {
+    let mut vfs = Vfs::new();
     
-    pub fn find_child(&self, name: &str) -> Option<&VfsNode> {
-        self.children.iter().find(|child| child.name == name)
-    }
+    // Монтирование корневой ФС
+    vfs.mount("/", FsType::Zfs, Some("/dev/sda1")).unwrap();
     
-    pub fn find_child_mut(&mut self, name: &str) -> Option<&mut VfsNode> {
-        self.children.iter_mut().find(|child| child.name == name)
-    }
+    // Монтирование /home
+    vfs.mount("/home", FsType::Zfs, Some("/dev/sda2")).unwrap();
+    
+    // Монтирование tmpfs для /tmp
+    vfs.mount("/tmp", FsType::Tmpfs, None).unwrap();
+    
+    vfs
 }
 
-/// Root filesystem
-static ROOT_FS: Mutex<Option<VfsNode>> = Mutex::new(None);
-static NEXT_FD_ID: Mutex<u64> = Mutex::new(1);
-
-/// Initialize filesystem
-pub fn init() {
-    println!("Initializing filesystem...");
+/// Стандартные файловые дескрипторы
+pub mod stdio {
+    use super::*;
     
-    // Create root directory
-    let mut root = VfsNode::new("/", FileType::Directory);
-    
-    // Create standard directories
-    let home = VfsNode::new("home", FileType::Directory);
-    let etc = VfsNode::new("etc", FileType::Directory);
-    let tmp = VfsNode::new("tmp", FileType::Directory);
-    let dev = VfsNode::new("dev", FileType::Directory);
-    let proc = VfsNode::new("proc", FileType::Directory);
-    let sys = VfsNode::new("sys", FileType::Directory);
-    
-    root.children.extend(vec![home, etc, tmp, dev, proc, sys]);
-    
-    let mut root_fs = ROOT_FS.lock();
-    *root_fs = Some(root);
-}
-
-/// Open a file
-pub fn open(path: &str, mode: FileMode) -> Result<u64, &'static str> {
-    let root_fs = ROOT_FS.lock();
-    if root_fs.is_none() {
-        return Err("Filesystem not initialized");
-    }
-    
-    let fd_id = *NEXT_FD_ID.lock();
-    *NEXT_FD_ID.lock() += 1;
-    
-    // Parse path and find node
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let mut current = root_fs.as_ref().unwrap();
-    
-    for part in parts {
-        if let Some(child) = current.find_child(part) {
-            current = child;
-        } else {
-            return Err("File not found");
-        }
-    }
-    
-    Ok(fd_id)
-}
-
-/// Read from file
-pub fn read(fd: u64, buffer: &mut [u8]) -> Result<usize, &'static str> {
-    // In real implementation, would look up FD and read content
-    Ok(buffer.len())
-}
-
-/// Write to file
-pub fn write(fd: u64, data: &[u8]) -> Result<usize, &'static str> {
-    // In real implementation, would look up FD and write content
-    Ok(data.len())
-}
-
-/// Close file descriptor
-pub fn close(fd: u64) -> Result<(), &'static str> {
-    Ok(())
-}
-
-/// Create directory
-pub fn mkdir(path: &str) -> Result<(), &'static str> {
-    let mut root_fs = ROOT_FS.lock();
-    if root_fs.is_none() {
-        return Err("Filesystem not initialized");
-    }
-    
-    // Parse parent path and create directory
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.is_empty() {
-        return Err("Invalid path");
-    }
-    
-    let dir_name = parts.last().unwrap();
-    let mut current = root_fs.as_mut().unwrap();
-    
-    // Navigate to parent
-    for part in parts.iter().take(parts.len() - 1) {
-        if let Some(child) = current.find_child_mut(part) {
-            current = child;
-        } else {
-            return Err("Parent directory not found");
-        }
-    }
-    
-    // Check if already exists
-    if current.find_child(dir_name).is_some() {
-        return Err("Directory already exists");
-    }
-    
-    // Create new directory
-    let new_dir = VfsNode::new(dir_name, FileType::Directory);
-    current.children.push(new_dir);
-    
-    Ok(())
-}
-
-/// Remove file or directory
-pub fn remove(path: &str) -> Result<(), &'static str> {
-    let mut root_fs = ROOT_FS.lock();
-    if root_fs.is_none() {
-        return Err("Filesystem not initialized");
-    }
-    
-    // Similar logic to mkdir but removes the node
-    Ok(())
-}
-
-/// List directory contents
-pub fn readdir(path: &str) -> Result<Vec<String>, &'static str> {
-    let root_fs = ROOT_FS.lock();
-    if root_fs.is_none() {
-        return Err("Filesystem not initialized");
-    }
-    
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let mut current = root_fs.as_ref().unwrap();
-    
-    for part in parts {
-        if let Some(child) = current.find_child(part) {
-            current = child;
-        } else {
-            return Err("Directory not found");
-        }
-    }
-    
-    if current.metadata.file_type != FileType::Directory {
-        return Err("Not a directory");
-    }
-    
-    Ok(current.children.iter().map(|c| c.name.clone()).collect())
+    /// stdin (FD 0)
+    pub const STDIN_FILENO: usize = 0;
+    /// stdout (FD 1)
+    pub const STDOUT_FILENO: usize = 1;
+    /// stderr (FD 2)
+    pub const STDERR_FILENO: usize = 2;
 }
